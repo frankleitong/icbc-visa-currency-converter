@@ -44,7 +44,9 @@ ICBC USD to RMB is fetched from ICBC's official RMB FX quote API:
 
 The trend charts use market TRY/USD history and ICBC USD/CNY history. The
 combined chart multiplies the two series to show CNY per 1 TRY for dates where
-both sources returned data.
+both sources returned data. All three charts are drawn as percentage change from
+their own first visible point and share the same percentage y-axis scale, making
+relative movement easier to compare across rates with very different raw values.
 
 ## Requirements
 

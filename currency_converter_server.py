@@ -621,7 +621,7 @@ INDEX_HTML = """<!doctype html>
             <canvas id="try-usd-chart"></canvas>
             <div class="chart-empty">No chart data.</div>
           </div>
-          <div class="chart-note">USD per 1 TRY, market rate.</div>
+          <div class="chart-note">Line shows % change from first visible TRY/USD point.</div>
         </article>
 
         <article class="chart-card">
@@ -633,7 +633,7 @@ INDEX_HTML = """<!doctype html>
             <canvas id="usd-cny-chart"></canvas>
             <div class="chart-empty">No chart data.</div>
           </div>
-          <div class="chart-note">RMB per 1 USD, using the selected ICBC field.</div>
+          <div class="chart-note">Line shows % change from first visible USD/CNY point.</div>
         </article>
 
         <article class="chart-card">
@@ -645,7 +645,7 @@ INDEX_HTML = """<!doctype html>
             <canvas id="try-cny-chart"></canvas>
             <div class="chart-empty">No chart data.</div>
           </div>
-          <div class="chart-note">Combined result: TRY -> USD -> CNY.</div>
+          <div class="chart-note">Line shows % change from first visible combined TRY/CNY point.</div>
         </article>
       </div>
     </section>
@@ -750,16 +750,42 @@ INDEX_HTML = """<!doctype html>
         : "manual";
     }
 
-    function chartSummary(points, precision) {
+    function formatPercent(value) {
+      const prefix = value > 0 ? "+" : "";
+      return `${prefix}${value.toFixed(2)}%`;
+    }
+
+    function chartSummary(points) {
       if (!points.length) return "--";
       const values = points.map((point) => point.value);
       const latest = values[values.length - 1];
       const high = Math.max(...values);
       const low = Math.min(...values);
-      return `Latest ${latest.toFixed(precision)} · H ${high.toFixed(precision)} · L ${low.toFixed(precision)}`;
+      return `Δ ${formatPercent(latest)} · H ${formatPercent(high)} · L ${formatPercent(low)}`;
     }
 
-    function drawLineChart(config, points) {
+    function normalizeToPercent(points) {
+      if (!points.length || points[0].value === 0) return [];
+      const base = points[0].value;
+      return points.map((point) => ({
+        date: point.date,
+        rawValue: point.value,
+        value: ((point.value - base) / base) * 100,
+      }));
+    }
+
+    function sharedPercentScale(series) {
+      const values = series.flatMap((points) => points.map((point) => point.value));
+      if (!values.length) return { min: -1, max: 1 };
+      let min = Math.min(...values, 0);
+      let max = Math.max(...values, 0);
+      const range = max - min || Math.max(Math.abs(max), 1);
+      min -= range * 0.12;
+      max += range * 0.12;
+      return { min, max };
+    }
+
+    function drawLineChart(config, points, scaleRange = null) {
       const canvas = config.canvas;
       const wrap = config.wrap;
       const ctx = canvas.getContext("2d");
@@ -772,7 +798,7 @@ INDEX_HTML = """<!doctype html>
       ctx.setTransform(scale, 0, 0, scale, 0, 0);
       ctx.clearRect(0, 0, width, height);
 
-      config.stat.textContent = chartSummary(points, config.precision);
+      config.stat.textContent = chartSummary(points);
       wrap.classList.toggle("empty", points.length < 2);
       if (points.length < 2) return;
 
@@ -780,11 +806,12 @@ INDEX_HTML = """<!doctype html>
       const plotWidth = width - padding.left - padding.right;
       const plotHeight = height - padding.top - padding.bottom;
       const values = points.map((point) => point.value);
-      let min = Math.min(...values);
-      let max = Math.max(...values);
-      const range = max - min || Math.abs(max) || 1;
-      min -= range * 0.12;
-      max += range * 0.12;
+      let min = scaleRange ? scaleRange.min : Math.min(...values, 0);
+      let max = scaleRange ? scaleRange.max : Math.max(...values, 0);
+      if (min === max) {
+        min -= 1;
+        max += 1;
+      }
 
       const xFor = (index) => padding.left + (plotWidth * index) / (points.length - 1);
       const yFor = (value) => padding.top + plotHeight - ((value - min) / (max - min)) * plotHeight;
@@ -801,7 +828,7 @@ INDEX_HTML = """<!doctype html>
         ctx.moveTo(padding.left, y);
         ctx.lineTo(width - padding.right, y);
         ctx.stroke();
-        ctx.fillText(value.toFixed(config.precision), 6, y);
+        ctx.fillText(formatPercent(value), 6, y);
       }
 
       ctx.textBaseline = "top";
@@ -847,12 +874,17 @@ INDEX_HTML = """<!doctype html>
 
     function renderCharts(payload) {
       latestChartPayload = payload;
+      const series = {};
       for (const [name, config] of Object.entries(chartConfigs)) {
         const points = (payload.charts[name] || []).map((point) => ({
           date: point.date,
           value: Number(point.value),
         })).filter((point) => Number.isFinite(point.value));
-        drawLineChart(config, points);
+        series[name] = normalizeToPercent(points);
+      }
+      const scaleRange = sharedPercentScale(Object.values(series));
+      for (const [name, config] of Object.entries(chartConfigs)) {
+        drawLineChart(config, series[name] || [], scaleRange);
       }
     }
 
