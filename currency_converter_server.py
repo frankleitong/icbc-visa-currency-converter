@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import datetime as dt
 import json
 import sys
+import time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,16 +17,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from icbc_visa_currency_converter import (  # noqa: E402
     ConverterError,
+    FRANKFURTER_API,
     ICBC_FX_PAGE,
     VISA_API_HOSTS,
     VISA_CALCULATOR_PAGE,
     fetch_icbc_usd_row,
+    fetch_market_try_usd_rate,
     fetch_visa_or_market_usd_amount,
     money,
+    request_json,
 )
 
 
 DEFAULT_PORT = 8766
+CHART_CACHE_SECONDS = 10 * 60
+CHART_MAX_DAYS = 90
+CHART_CACHE: dict[tuple[int, str, str], tuple[float, dict[str, object]]] = {}
 ICBC_FIELDS = {
     "foreignSell": "Bank selling rate / 银行卖出价",
     "foreignBuy": "Bank buying rate / 银行买入价",
@@ -276,6 +284,125 @@ INDEX_HTML = """<!doctype html>
       font-weight: 650;
     }
 
+    .charts {
+      margin-top: 18px;
+    }
+
+    .charts-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 12px;
+    }
+
+    .charts-header h2 {
+      margin: 0;
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+
+    .chart-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .chart-controls label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .chart-controls select {
+      width: auto;
+      min-width: 120px;
+    }
+
+    .chart-status {
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 13px;
+      min-height: 20px;
+    }
+
+    .chart-status.warning {
+      color: #6f5310;
+    }
+
+    .chart-status.error {
+      color: #8d2323;
+    }
+
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .chart-card {
+      min-width: 0;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+
+    .chart-title {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .chart-title h3 {
+      margin: 0;
+      font-size: 15px;
+      letter-spacing: 0;
+    }
+
+    .chart-stat {
+      color: var(--muted);
+      font-size: 12px;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .chart-wrap {
+      position: relative;
+      height: 230px;
+    }
+
+    .chart-wrap canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    .chart-empty {
+      display: none;
+      position: absolute;
+      inset: 0;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      text-align: center;
+      padding: 16px;
+    }
+
+    .chart-wrap.empty .chart-empty {
+      display: flex;
+    }
+
+    .chart-note {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      min-height: 18px;
+    }
+
     @media (max-width: 850px) {
       header,
       .layout {
@@ -289,6 +416,15 @@ INDEX_HTML = """<!doctype html>
 
       .panel {
         margin-bottom: 14px;
+      }
+
+      .chart-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .charts-header {
+        align-items: flex-start;
+        flex-direction: column;
       }
     }
 
@@ -457,6 +593,62 @@ INDEX_HTML = """<!doctype html>
         </div>
       </section>
     </section>
+
+    <section class="charts">
+      <div class="charts-header">
+        <h2>Rate Trends</h2>
+        <div class="chart-controls">
+          <label>
+            Range
+            <select id="chart-days">
+              <option value="30" selected>30 days</option>
+              <option value="60">60 days</option>
+              <option value="90">90 days</option>
+            </select>
+          </label>
+          <button class="secondary" id="refresh-charts" type="button">Refresh</button>
+        </div>
+      </div>
+      <div id="chart-status" class="chart-status">Chart trends are loading.</div>
+
+      <div class="chart-grid">
+        <article class="chart-card">
+          <div class="chart-title">
+            <h3>TRY -> USD</h3>
+            <div id="try-usd-stat" class="chart-stat">--</div>
+          </div>
+          <div id="try-usd-wrap" class="chart-wrap">
+            <canvas id="try-usd-chart"></canvas>
+            <div class="chart-empty">No chart data.</div>
+          </div>
+          <div class="chart-note">USD per 1 TRY, market rate.</div>
+        </article>
+
+        <article class="chart-card">
+          <div class="chart-title">
+            <h3>USD -> CNY</h3>
+            <div id="usd-cny-stat" class="chart-stat">--</div>
+          </div>
+          <div id="usd-cny-wrap" class="chart-wrap">
+            <canvas id="usd-cny-chart"></canvas>
+            <div class="chart-empty">No chart data.</div>
+          </div>
+          <div class="chart-note">RMB per 1 USD, using the selected ICBC field.</div>
+        </article>
+
+        <article class="chart-card">
+          <div class="chart-title">
+            <h3>TRY -> CNY</h3>
+            <div id="try-cny-stat" class="chart-stat">--</div>
+          </div>
+          <div id="try-cny-wrap" class="chart-wrap">
+            <canvas id="try-cny-chart"></canvas>
+            <div class="chart-empty">No chart data.</div>
+          </div>
+          <div class="chart-note">Combined result: TRY -> USD -> CNY.</div>
+        </article>
+      </div>
+    </section>
   </main>
 
   <script>
@@ -464,6 +656,7 @@ INDEX_HTML = """<!doctype html>
     const visaMode = document.querySelector("#visa-mode");
     const calculateButton = document.querySelector("#calculate-button");
     const statusBox = document.querySelector("#status");
+    const chartStatusBox = document.querySelector("#chart-status");
 
     const fields = {
       usdAmount: document.querySelector("#usd-amount"),
@@ -478,6 +671,31 @@ INDEX_HTML = """<!doctype html>
       icbcField: document.querySelector("#icbc-field"),
       icbcPublish: document.querySelector("#icbc-publish"),
     };
+
+    const chartConfigs = {
+      try_usd: {
+        canvas: document.querySelector("#try-usd-chart"),
+        wrap: document.querySelector("#try-usd-wrap"),
+        stat: document.querySelector("#try-usd-stat"),
+        color: "#b31b2c",
+        precision: 6,
+      },
+      usd_cny: {
+        canvas: document.querySelector("#usd-cny-chart"),
+        wrap: document.querySelector("#usd-cny-wrap"),
+        stat: document.querySelector("#usd-cny-stat"),
+        color: "#245d63",
+        precision: 4,
+      },
+      try_cny: {
+        canvas: document.querySelector("#try-cny-chart"),
+        wrap: document.querySelector("#try-cny-wrap"),
+        stat: document.querySelector("#try-cny-stat"),
+        color: "#7a4f00",
+        precision: 4,
+      },
+    };
+    let latestChartPayload = null;
 
     function today() {
       const now = new Date();
@@ -511,6 +729,11 @@ INDEX_HTML = """<!doctype html>
       statusBox.className = kind ? `status ${kind}` : "status";
     }
 
+    function setChartStatus(message, kind = "") {
+      chartStatusBox.textContent = message;
+      chartStatusBox.className = kind ? `chart-status ${kind}` : "chart-status";
+    }
+
     function setResult(data) {
       fields.usdAmount.textContent = `${data.visa_usd_amount} USD`;
       fields.tryUsdRate.textContent = data.visa_usd_per_try;
@@ -525,6 +748,131 @@ INDEX_HTML = """<!doctype html>
       fields.icbcPublish.textContent = data.icbc_publish_date
         ? `${data.icbc_publish_date} ${data.icbc_publish_time || ""}`.trim()
         : "manual";
+    }
+
+    function chartSummary(points, precision) {
+      if (!points.length) return "--";
+      const values = points.map((point) => point.value);
+      const latest = values[values.length - 1];
+      const high = Math.max(...values);
+      const low = Math.min(...values);
+      return `Latest ${latest.toFixed(precision)} · H ${high.toFixed(precision)} · L ${low.toFixed(precision)}`;
+    }
+
+    function drawLineChart(config, points) {
+      const canvas = config.canvas;
+      const wrap = config.wrap;
+      const ctx = canvas.getContext("2d");
+      const rect = wrap.getBoundingClientRect();
+      const scale = window.devicePixelRatio || 1;
+      const width = Math.max(260, Math.floor(rect.width));
+      const height = Math.max(180, Math.floor(rect.height));
+      canvas.width = Math.floor(width * scale);
+      canvas.height = Math.floor(height * scale);
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+
+      config.stat.textContent = chartSummary(points, config.precision);
+      wrap.classList.toggle("empty", points.length < 2);
+      if (points.length < 2) return;
+
+      const padding = { top: 18, right: 12, bottom: 30, left: 54 };
+      const plotWidth = width - padding.left - padding.right;
+      const plotHeight = height - padding.top - padding.bottom;
+      const values = points.map((point) => point.value);
+      let min = Math.min(...values);
+      let max = Math.max(...values);
+      const range = max - min || Math.abs(max) || 1;
+      min -= range * 0.12;
+      max += range * 0.12;
+
+      const xFor = (index) => padding.left + (plotWidth * index) / (points.length - 1);
+      const yFor = (value) => padding.top + plotHeight - ((value - min) / (max - min)) * plotHeight;
+
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "#e5e9ef";
+      ctx.fillStyle = "#5e6b7b";
+      ctx.font = "11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+      ctx.textBaseline = "middle";
+      for (let i = 0; i <= 4; i += 1) {
+        const value = min + ((max - min) * i) / 4;
+        const y = yFor(value);
+        ctx.beginPath();
+        ctx.moveTo(padding.left, y);
+        ctx.lineTo(width - padding.right, y);
+        ctx.stroke();
+        ctx.fillText(value.toFixed(config.precision), 6, y);
+      }
+
+      ctx.textBaseline = "top";
+      ctx.fillText(points[0].date.slice(5), padding.left, height - 20);
+      const lastDate = points[points.length - 1].date.slice(5);
+      const lastWidth = ctx.measureText(lastDate).width;
+      ctx.fillText(lastDate, width - padding.right - lastWidth, height - 20);
+
+      const gradient = ctx.createLinearGradient(0, padding.top, 0, height - padding.bottom);
+      gradient.addColorStop(0, `${config.color}22`);
+      gradient.addColorStop(1, `${config.color}00`);
+
+      ctx.beginPath();
+      points.forEach((point, index) => {
+        const x = xFor(index);
+        const y = yFor(point.value);
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.lineTo(width - padding.right, height - padding.bottom);
+      ctx.lineTo(padding.left, height - padding.bottom);
+      ctx.closePath();
+      ctx.fillStyle = gradient;
+      ctx.fill();
+
+      ctx.beginPath();
+      points.forEach((point, index) => {
+        const x = xFor(index);
+        const y = yFor(point.value);
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = config.color;
+      ctx.stroke();
+
+      const latest = points[points.length - 1];
+      ctx.beginPath();
+      ctx.arc(xFor(points.length - 1), yFor(latest.value), 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = config.color;
+      ctx.fill();
+    }
+
+    function renderCharts(payload) {
+      latestChartPayload = payload;
+      for (const [name, config] of Object.entries(chartConfigs)) {
+        const points = (payload.charts[name] || []).map((point) => ({
+          date: point.date,
+          value: Number(point.value),
+        })).filter((point) => Number.isFinite(point.value));
+        drawLineChart(config, points);
+      }
+    }
+
+    async function loadCharts() {
+      const days = document.querySelector("#chart-days").value;
+      const icbcField = document.querySelector('select[name="icbc_field"]').value;
+      const params = new URLSearchParams({ days, icbc_field: icbcField });
+      setChartStatus("Loading chart trends...");
+      try {
+        const response = await fetch(`/api/charts?${params.toString()}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Chart loading failed");
+        renderCharts(data);
+        setChartStatus(data.warning || "Charts updated.", data.warning ? "warning" : "");
+      } catch (error) {
+        Object.values(chartConfigs).forEach((config) => {
+          drawLineChart(config, []);
+        });
+        setChartStatus(error.message, "error");
+      }
     }
 
     async function calculate() {
@@ -551,18 +899,27 @@ INDEX_HTML = """<!doctype html>
     visaMode.addEventListener("change", updateVisaMode);
     document.querySelector("#amount-try").addEventListener("input", updateTaxPreview);
     document.querySelector('input[name="try_tax_rate"]').addEventListener("input", updateTaxPreview);
+    document.querySelector("#chart-days").addEventListener("change", loadCharts);
+    document.querySelector("#refresh-charts").addEventListener("click", loadCharts);
+    document.querySelector('select[name="icbc_field"]').addEventListener("change", loadCharts);
+    window.addEventListener("resize", () => {
+      if (latestChartPayload) renderCharts(latestChartPayload);
+    });
     document.querySelector("#reset-button").addEventListener("click", () => {
       form.reset();
       setDefaultDates();
       updateVisaMode();
       updateTaxPreview();
       setStatus("Ready.");
+      setChartStatus("Chart trends are loading.");
+      loadCharts();
     });
 
     setDefaultDates();
     updateVisaMode();
     updateTaxPreview();
     calculate();
+    loadCharts();
   </script>
 </body>
 </html>
@@ -663,6 +1020,168 @@ def calculate(params: dict[str, list[str]]) -> dict[str, object]:
     }
 
 
+def parse_days(params: dict[str, list[str]]) -> int:
+    raw = params.get("days", ["30"])[0]
+    try:
+        days = int(raw)
+    except ValueError as exc:
+        raise ConverterError("days must be a whole number") from exc
+    if days < 2 or days > CHART_MAX_DAYS:
+        raise ConverterError(f"days must be between 2 and {CHART_MAX_DAYS}")
+    return days
+
+
+def chart_dates(days: int) -> tuple[dt.date, dt.date]:
+    end = dt.date.today()
+    start = end - dt.timedelta(days=days - 1)
+    return start, end
+
+
+def date_range(start: dt.date, end: dt.date) -> list[dt.date]:
+    return [start + dt.timedelta(days=offset) for offset in range((end - start).days + 1)]
+
+
+def chart_point(day: dt.date, value: Decimal, places: str) -> dict[str, str]:
+    return {
+        "date": day.isoformat(),
+        "value": decimal_text(value, places),
+    }
+
+
+def fetch_frankfurter_try_usd_series(start: dt.date, end: dt.date) -> list[dict[str, str]]:
+    query = f"{FRANKFURTER_API}/{start.isoformat()}..{end.isoformat()}?from=TRY&to=USD"
+    data = request_json(query)
+    rates = data.get("rates")
+    if not isinstance(rates, dict):
+        raise ConverterError("Frankfurter history response did not include rates")
+
+    points: list[dict[str, str]] = []
+    for date_text, rate_row in sorted(rates.items()):
+        if not isinstance(rate_row, dict) or rate_row.get("USD") is None:
+            continue
+        try:
+            day = dt.date.fromisoformat(date_text)
+            rate = Decimal(str(rate_row["USD"]))
+        except (ValueError, InvalidOperation):
+            continue
+        points.append(chart_point(day, rate, "0.000001"))
+
+    if not points:
+        raise ConverterError("Frankfurter history response did not include TRY/USD points")
+    return points
+
+
+def fetch_try_usd_chart(start: dt.date, end: dt.date) -> tuple[list[dict[str, str]], list[str]]:
+    warnings: list[str] = []
+    try:
+        points = fetch_frankfurter_try_usd_series(start, end)
+    except ConverterError as exc:
+        warnings.append(str(exc))
+        points = []
+
+    today = dt.date.today()
+    if end == today and not any(point["date"] == today.isoformat() for point in points):
+        try:
+            rate, _label, _source = fetch_market_try_usd_rate(today)
+            points.append(chart_point(today, rate, "0.000001"))
+            points.sort(key=lambda point: point["date"])
+        except ConverterError as exc:
+            warnings.append(str(exc))
+
+    if not points:
+        raise ConverterError("TRY/USD chart data could not be fetched")
+    return points, warnings
+
+
+def fetch_usd_cny_point(day: dt.date, icbc_field: str) -> tuple[dict[str, str] | None, str | None]:
+    quote_date = None if day == dt.date.today() else day
+    try:
+        row, _source = fetch_icbc_usd_row(quote_date)
+        rate_per_100 = Decimal(str(row[icbc_field]).replace(",", ""))
+    except (ConverterError, InvalidOperation, KeyError) as exc:
+        return None, f"{day.isoformat()}: {exc}"
+    return chart_point(day, rate_per_100 / Decimal("100"), "0.0001"), None
+
+
+def fetch_usd_cny_chart(
+    start: dt.date, end: dt.date, icbc_field: str
+) -> tuple[list[dict[str, str]], list[str]]:
+    points: list[dict[str, str]] = []
+    warnings: list[str] = []
+    days = date_range(start, end)
+    worker_count = min(8, len(days))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(fetch_usd_cny_point, day, icbc_field) for day in days]
+        for future in concurrent.futures.as_completed(futures):
+            point, warning = future.result()
+            if point is not None:
+                points.append(point)
+            if warning is not None:
+                warnings.append(warning)
+
+    if not points:
+        raise ConverterError("ICBC USD/CNY chart data could not be fetched")
+    points.sort(key=lambda point: point["date"])
+    return points, warnings
+
+
+def combine_try_cny(
+    try_usd_points: list[dict[str, str]], usd_cny_points: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    try_usd_by_date = {point["date"]: Decimal(point["value"]) for point in try_usd_points}
+    usd_cny_by_date = {point["date"]: Decimal(point["value"]) for point in usd_cny_points}
+    combined: list[dict[str, str]] = []
+    for date_text in sorted(try_usd_by_date.keys() & usd_cny_by_date.keys()):
+        day = dt.date.fromisoformat(date_text)
+        combined.append(
+            chart_point(day, try_usd_by_date[date_text] * usd_cny_by_date[date_text], "0.0001")
+        )
+    return combined
+
+
+def chart_warning(try_warnings: list[str], icbc_warnings: list[str]) -> str | None:
+    skipped = len(try_warnings) + len(icbc_warnings)
+    if not skipped:
+        return None
+    return (
+        "Some historical dates were skipped because one source did not return data. "
+        "The lines still show the available trend points."
+    )
+
+
+def charts(params: dict[str, list[str]]) -> dict[str, object]:
+    days = parse_days(params)
+    icbc_field = params.get("icbc_field", ["foreignSell"])[0]
+    if icbc_field not in ICBC_FIELDS:
+        raise ConverterError("unsupported ICBC rate field")
+
+    cache_key = (days, icbc_field, dt.date.today().isoformat())
+    cached = CHART_CACHE.get(cache_key)
+    now = time.time()
+    if cached and now - cached[0] < CHART_CACHE_SECONDS:
+        return cached[1]
+
+    start, end = chart_dates(days)
+    try_usd_points, try_warnings = fetch_try_usd_chart(start, end)
+    usd_cny_points, icbc_warnings = fetch_usd_cny_chart(start, end, icbc_field)
+    try_cny_points = combine_try_cny(try_usd_points, usd_cny_points)
+
+    payload: dict[str, object] = {
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "days": days,
+        "icbc_field": f"{icbc_field} ({ICBC_FIELDS[icbc_field]})",
+        "charts": {
+            "try_usd": try_usd_points,
+            "usd_cny": usd_cny_points,
+            "try_cny": try_cny_points,
+        },
+        "warning": chart_warning(try_warnings, icbc_warnings),
+    }
+    CHART_CACHE[cache_key] = (now, payload)
+    return payload
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -697,6 +1216,13 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/convert":
             try:
                 self.send_json(200, calculate(parse_qs(parsed.query)))
+            except ConverterError as exc:
+                self.send_json(400, {"error": str(exc)})
+            return
+
+        if parsed.path == "/api/charts":
+            try:
+                self.send_json(200, charts(parse_qs(parsed.query)))
             except ConverterError as exc:
                 self.send_json(400, {"error": str(exc)})
             return

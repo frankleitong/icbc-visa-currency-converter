@@ -21,6 +21,7 @@ The flow modeled by this tool is:
 - Configurable ICBC rate field, default `foreignSell`
 - Manual fallback inputs for Visa USD amount or TRY-to-USD rate
 - Live ICBC official FX quote fetching
+- Browser charts for TRY -> USD, USD -> CNY, and the combined TRY -> CNY trend
 
 ## Rate Sources
 
@@ -40,6 +41,10 @@ ICBC USD to RMB is fetched from ICBC's official RMB FX quote API:
 
 - Official page: <https://www.icbc.com.cn/column/1438058341489590354.html>
 - Default field: `foreignSell` / `银行卖出价`
+
+The trend charts use market TRY/USD history and ICBC USD/CNY history. The
+combined chart multiplies the two series to show CNY per 1 TRY for dates where
+both sources returned data.
 
 ## Requirements
 
